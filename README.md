@@ -15,6 +15,8 @@ its TLS fingerprint is consistent with the Edge browser.
 
 it can only run on the Windows platform.
 
+this project uses python's built-in ctypes to call winhttp.dll directly, with no dependencies on third-party packages.
+
 # Install
 ```$ pip install pywinhttp```
 
