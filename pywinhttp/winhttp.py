@@ -4,6 +4,16 @@ from ctypes import wintypes
 from urllib.parse import urlparse
 
 
+class WinhttpException(Exception):
+    def __init__(self, msg: str, last_error: int = 0, status_code: int = None):
+        self.msg = msg
+        self.last_error = last_error
+        self.status_code = status_code
+
+    def __str__(self):
+        return json.dumps({"msg": self.msg, "last_error": self.last_error, "status_code": self.status_code})
+
+
 class Response:
     def __init__(self, status_code: int, headers: dict, content: bytes, url: str):
         self.status_code = status_code
@@ -21,12 +31,27 @@ class Response:
 
     def raise_for_status(self):
         if 400 <= self.status_code:
-            raise RuntimeError(f"HTTP {self.status_code} for {self.url}")
+            raise WinhttpException(f"HTTP {self.status_code} for {self.url}", status_code = self.status_code)
+
+
+class HttpProxy:
+    def __init__(self, host: str, port: int | str, username: str = None, password: str = None):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
 
 
 class Session:
     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
+    WINHTTP_ACCESS_TYPE_NO_PROXY = 1
+    WINHTTP_ACCESS_TYPE_NAMED_PROXY = 3
     WINHTTP_FLAG_SECURE = 0x00800000
+    WINHTTP_OPTION_PROXY = 38
+    WINHTTP_NO_PROXY_BYPASS = None
+
+    WINHTTP_AUTH_TARGET_PROXY = 1
+    WINHTTP_AUTH_SCHEME_BASIC = 0x00000001
 
     INTERNET_DEFAULT_HTTP_PORT = 80
     INTERNET_DEFAULT_HTTPS_PORT = 443
@@ -35,9 +60,18 @@ class Session:
     WINHTTP_QUERY_RAW_HEADERS_CRLF = 22
     WINHTTP_QUERY_FLAG_NUMBER = 0x20000000
 
-    def __init__(self, user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"):
+    class WINHTTP_PROXY_INFO(ctypes.Structure):
+        _fields_ = [
+            ("dwAccessType", wintypes.DWORD),
+            ("lpszProxy", wintypes.LPCWSTR),
+            ("lpszProxyBypass", wintypes.LPCWSTR),
+        ]
+
+    def __init__(self, user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0", proxy: HttpProxy = None):
         self.user_agent = user_agent
         self.default_headers = {}
+        self.proxy: HttpProxy = proxy if proxy else None
+        self.timeout: int | None = None
         self.winhttp = ctypes.WinDLL("winhttp.dll", use_last_error=True)
         self._init_prototypes()
 
@@ -72,9 +106,28 @@ class Session:
         w.WinHttpQueryHeaders.restype = wintypes.BOOL
         w.WinHttpCloseHandle.argtypes = [wintypes.HANDLE]
         w.WinHttpCloseHandle.restype = wintypes.BOOL
+        w.WinHttpSetOption.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
+        w.WinHttpSetOption.restype = wintypes.BOOL
+        w.WinHttpSetCredentials.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPVOID,
+        ]
+        w.WinHttpSetCredentials.restype = wintypes.BOOL
+        w.WinHttpSetTimeouts.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        w.WinHttpSetTimeouts.restype = wintypes.BOOL
 
     def _raise_last_error(self, msg: str):
-        raise OSError(f"{msg}, GetLastError={ctypes.get_last_error()}")
+        raise WinhttpException(msg, ctypes.get_last_error())
 
     def _query_status_code(self, h_request) -> int:
         size = wintypes.DWORD(ctypes.sizeof(wintypes.DWORD))
@@ -126,7 +179,58 @@ class Session:
                 result[key] = value
         return result
 
-    def request(self, method: str, url: str, params: dict | None = None, data=None, json_data=None, headers: dict | None = None) -> Response:
+    def _set_proxy_option(self, h_session):
+        if self.proxy is None:
+            return
+        proxy_server = f"{self.proxy.host}:{self.proxy.port}"
+        proxy_list = f"http={proxy_server};https={proxy_server}"
+        proxy_info = self.WINHTTP_PROXY_INFO(
+            self.WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+            proxy_list,
+            self.WINHTTP_NO_PROXY_BYPASS,
+        )
+        ok = self.winhttp.WinHttpSetOption(
+            h_session,
+            self.WINHTTP_OPTION_PROXY,
+            ctypes.byref(proxy_info),
+            ctypes.sizeof(proxy_info),
+        )
+        if not ok:
+            self._raise_last_error("WinHttpSetOption(proxy) failed")
+
+    def _set_proxy_credentials(self, h_request):
+        if self.proxy is None:
+            return
+        if not self.proxy.username:
+            return
+        ok = self.winhttp.WinHttpSetCredentials(
+            h_request,
+            self.WINHTTP_AUTH_TARGET_PROXY,
+            self.WINHTTP_AUTH_SCHEME_BASIC,
+            self.proxy.username,
+            self.proxy.password or "",
+            None,
+        )
+        if not ok:
+            self._raise_last_error("WinHttpSetCredentials(proxy) failed")
+
+    def _set_timeouts(self, h_session, timeout: int | None):
+        if timeout is None:
+            return
+        timeout_ms = int(timeout)
+        if timeout_ms < 0:
+            raise ValueError("timeout must be >= 0")
+        ok = self.winhttp.WinHttpSetTimeouts(
+            h_session,
+            timeout_ms,
+            timeout_ms,
+            timeout_ms,
+            timeout_ms,
+        )
+        if not ok:
+            self._raise_last_error("WinHttpSetTimeouts failed")
+
+    def request(self, method: str, url: str, params: dict | None = None, data=None, json_data=None, headers: dict | None = None, timeout: int | None = None) -> Response:
         parsed = urlparse(url)
         if parsed.scheme.lower() not in ("http", "https"):
             raise ValueError("URL must start with http:// or https://")
@@ -165,6 +269,9 @@ class Session:
             )
             if not h_session:
                 self._raise_last_error("WinHttpOpen failed")
+            effective_timeout = self.timeout if timeout is None else timeout
+            self._set_timeouts(h_session, effective_timeout)
+            self._set_proxy_option(h_session)
 
             h_connect = self.winhttp.WinHttpConnect(h_session, parsed.hostname, port, 0)
             if not h_connect:
@@ -175,6 +282,7 @@ class Session:
             )
             if not h_request:
                 self._raise_last_error("WinHttpOpenRequest failed")
+            self._set_proxy_credentials(h_request)
 
             body_buf = ctypes.create_string_buffer(body) if body else None
             body_ptr = ctypes.cast(body_buf, wintypes.LPVOID) if body_buf else None
@@ -193,6 +301,8 @@ class Session:
                 self._raise_last_error("WinHttpReceiveResponse failed")
 
             status_code = self._query_status_code(h_request)
+            if status_code == 407:
+                raise WinhttpException("Proxy authentication failed (HTTP 407)", ctypes.get_last_error(), status_code)
             raw_headers = self._query_raw_headers(h_request)
             response_headers = self._parse_headers(raw_headers)
 
@@ -220,20 +330,20 @@ class Session:
             if h_session:
                 self.winhttp.WinHttpCloseHandle(h_session)
 
-    def get(self, url: str, params: dict | None = None, headers: dict | None = None) -> Response:
-        return self.request("GET", url, params=params, headers=headers)
+    def get(self, url: str, params: dict | None = None, headers: dict | None = None, timeout: int | None = None) -> Response:
+        return self.request("GET", url, params=params, headers=headers, timeout=timeout)
 
-    def post(self, url: str, data=None, json=None, headers: dict | None = None) -> Response:
-        return self.request("POST", url, data=data, json_data=json, headers=headers)
+    def post(self, url: str, data=None, json=None, headers: dict | None = None, timeout: int | None = None) -> Response:
+        return self.request("POST", url, data=data, json_data=json, headers=headers, timeout=timeout)
 
 
 def request(method: str, url: str, **kwargs) -> Response:
     return Session().request(method, url, **kwargs)
 
 
-def get(url: str, params: dict | None = None, headers: dict | None = None) -> Response:
-    return Session().get(url, params=params, headers=headers)
+def get(url: str, params: dict | None = None, headers: dict | None = None, timeout: int | None = None) -> Response:
+    return Session().get(url, params=params, headers=headers, timeout=timeout)
 
 
-def post(url: str, data=None, json=None, headers: dict | None = None) -> Response:
-    return Session().post(url, data=data, json=json, headers=headers)
+def post(url: str, data=None, json=None, headers: dict | None = None, timeout: int | None = None) -> Response:
+    return Session().post(url, data=data, json=json, headers=headers, timeout=timeout)
